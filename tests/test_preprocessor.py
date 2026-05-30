@@ -53,6 +53,7 @@ def test_no_nan_values():
     p = Preprocessor()
     df = p.extract_features(SAMPLE_MATCH)
     assert not df.isnull().any().any(), "Features should not contain NaN"
+    assert "form_x_winrate_diff" in df.columns
 
 
 def test_synthetic_data_shape():

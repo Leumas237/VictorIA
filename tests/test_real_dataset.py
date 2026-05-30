@@ -13,6 +13,7 @@ from data.stats_builder import (
     match_entry_for_team,
     match_outcome_label,
 )
+from data.preprocessor import FEATURE_NAMES
 from training.real_dataset import build_real_dataset
 
 
@@ -46,6 +47,8 @@ def test_compute_team_stats_from_entries():
     assert stats["draws"] == 1
     assert stats["losses"] == 1
     assert stats["matches_played"] == 3
+    assert "fixture_difficulty_recent" in stats
+    assert "clean_sheet_streak" in stats
 
 
 def test_compute_h2h():
@@ -88,7 +91,7 @@ def test_build_dataset_from_mock_matches(monkeypatch, tmp_path):
 
     X, y, meta = build_real_dataset(force_refresh=True, min_raw_matches=3)
     assert X.shape[0] == len(y)
-    assert X.shape[1] == 27
+    assert X.shape[1] == len(FEATURE_NAMES)
     assert len(y) >= 2
     assert meta["data_source"] == "mock"
     assert set(y.tolist()).issubset({0, 1, 2})
