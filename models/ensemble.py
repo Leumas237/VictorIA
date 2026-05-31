@@ -1,5 +1,5 @@
 """
-ensemble.py – Weighted soft-voting ensemble combining XGBoost, RF, and NN.
+ensemble.py – Weighted soft-voting ensemble combining XGBoost, RF, LightGBM and NN.
 Automatically trains all sub-models if not already cached.
 """
 from typing import List, Optional
@@ -10,6 +10,7 @@ import joblib
 import config
 from models.xgboost_model import XGBoostModel
 from models.random_forest_model import RandomForestModel
+from models.lightgbm_model import LightGBMModel, LGBM_AVAILABLE
 from models.neural_net import NeuralNetModel, TF_AVAILABLE
 
 LABELS = ["Victoire Domicile", "Nul", "Victoire Extérieur"]
@@ -26,30 +27,42 @@ class EnsembleModel:
         self.weights = list(weights or config.ENSEMBLE_WEIGHTS)
         self.xgb = XGBoostModel()
         self.rf = RandomForestModel()
+        self.lgbm = LightGBMModel()
         self.nn = NeuralNetModel()
         self._trained = False
+
+    def _lgbm_active(self) -> bool:
+        return (
+            LGBM_AVAILABLE
+            and self.lgbm._trained
+            and self.weights[config.ENSEMBLE_IDX_LGBM] > 0
+        )
 
     def _nn_active(self) -> bool:
         return (
             TF_AVAILABLE
             and self.nn._trained
             and self.nn.model is not None
-            and self.weights[2] > 0
+            and self.weights[config.ENSEMBLE_IDX_NN] > 0
         )
 
     def active_model_names(self) -> List[str]:
         names = ["XGBoost", "RandomForest"]
+        if self._lgbm_active():
+            names.append("LightGBM")
         if self._nn_active():
             names.append("NeuralNet")
         return names
 
     def _effective_weights(self) -> np.ndarray:
         w = np.array(self.weights, dtype=float)
+        if not self._lgbm_active():
+            w[config.ENSEMBLE_IDX_LGBM] = 0.0
         if not self._nn_active():
-            w[2] = 0.0
+            w[config.ENSEMBLE_IDX_NN] = 0.0
         total = w.sum()
         if total <= 0:
-            return np.array([0.5, 0.5, 0.0])
+            return np.array(config.ENSEMBLE_FALLBACK_WEIGHTS, dtype=float)
         return w / total
 
     # ──────────────────────────────────────────────────────────
@@ -57,13 +70,40 @@ class EnsembleModel:
         print("[Ensemble] Training sub-models …")
         self.xgb.train(X, y)
         self.rf.train(X, y)
-        if self.weights[2] > 0 and TF_AVAILABLE:
+        if self.weights[config.ENSEMBLE_IDX_LGBM] > 0 and LGBM_AVAILABLE:
+            self.lgbm.train(X, y)
+        else:
+            print("[Ensemble] LightGBM skipped (disabled or not installed).")
+        if self.weights[config.ENSEMBLE_IDX_NN] > 0 and TF_AVAILABLE:
             self.nn.train(X, y)
         else:
             print("[Ensemble] NeuralNet skipped (disabled or TensorFlow absent).")
+        self._adapt_weights_from_cv()
         self._trained = True
         self._save()
         print("[Ensemble] All sub-models trained and saved.")
+
+    def _adapt_weights_from_cv(self) -> None:
+        cv = {
+            "XGBoost": self.xgb.cv_score or 0.0,
+            "RandomForest": self.rf.cv_score or 0.0,
+            "LightGBM": self.lgbm.cv_score or 0.0,
+            "NeuralNet": self.nn.cv_score or 0.0,
+        }
+        names = ["XGBoost", "RandomForest", "LightGBM", "NeuralNet"]
+        enabled = [
+            True,
+            True,
+            self.weights[config.ENSEMBLE_IDX_LGBM] > 0 and self.lgbm.cv_score is not None,
+            self.weights[config.ENSEMBLE_IDX_NN] > 0 and self.nn.cv_score is not None,
+        ]
+        base = np.array(self.weights, dtype=float)
+        perf = np.array([max(cv[n], 0.01) for n in names], dtype=float)
+        raw = base * perf
+        raw[~np.array(enabled)] = 0.0
+        total = raw.sum()
+        if total > 0:
+            self.weights = (raw / total).tolist()
 
     def _save(self):
         joblib.dump(self, config.ENSEMBLE_PATH)
@@ -96,10 +136,16 @@ class EnsembleModel:
         p_xgb = self.xgb.predict_proba(X)
         p_rf = self.rf.predict_proba(X)
         w = self._effective_weights()
-        combined = w[0] * p_xgb + w[1] * p_rf
+        combined = (
+            w[config.ENSEMBLE_IDX_XGB] * p_xgb +
+            w[config.ENSEMBLE_IDX_RF] * p_rf
+        )
+        if self._lgbm_active():
+            p_lgbm = self.lgbm.predict_proba(X)
+            combined = combined + w[config.ENSEMBLE_IDX_LGBM] * p_lgbm
         if self._nn_active():
             p_nn = self.nn.predict_proba(X)
-            combined = combined + w[2] * p_nn
+            combined = combined + w[config.ENSEMBLE_IDX_NN] * p_nn
         row_sums = combined.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0
         return combined / row_sums
@@ -113,6 +159,11 @@ class EnsembleModel:
 
         p_xgb = self.xgb.predict_proba(X)[0]
         p_rf = self.rf.predict_proba(X)[0]
+        p_lgbm = (
+            self.lgbm.predict_proba(X)[0]
+            if self._lgbm_active()
+            else np.full(3, 1 / 3)
+        )
         p_nn = (
             self.nn.predict_proba(X)[0]
             if self._nn_active()
@@ -122,7 +173,12 @@ class EnsembleModel:
         outcome_idx = int(np.argmax(combined))
         confidence = float(combined[outcome_idx]) * 100
 
-        all_preds = np.array([p_xgb, p_rf, p_nn])
+        all_preds = [p_xgb, p_rf]
+        if self._lgbm_active():
+            all_preds.append(p_lgbm)
+        if self._nn_active():
+            all_preds.append(p_nn)
+        all_preds = np.array(all_preds)
         agreement = self._agreement_score(all_preds)
 
         model_breakdown = {
@@ -135,6 +191,11 @@ class EnsembleModel:
                 for k, v in zip(LABEL_SHORT, p_rf)
             },
         }
+        if self._lgbm_active():
+            model_breakdown["LightGBM"] = {
+                k: round(v * 100, 1)
+                for k, v in zip(LABEL_SHORT, p_lgbm)
+            }
         if self._nn_active():
             model_breakdown["NeuralNet"] = {
                 k: round(v * 100, 1)
@@ -172,5 +233,6 @@ class EnsembleModel:
         return {
             "XGBoost": self.xgb.cv_score,
             "RandomForest": self.rf.cv_score,
+            "LightGBM": self.lgbm.cv_score if self._lgbm_active() else None,
             "NeuralNet": self.nn.cv_score if self._nn_active() else None,
         }
