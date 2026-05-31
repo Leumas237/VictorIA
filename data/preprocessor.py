@@ -216,7 +216,9 @@ class Preprocessor:
             "home_advantage": 1.0,
         }
 
-        return pd.DataFrame([features], columns=FEATURE_NAMES)
+        # Create DataFrame and reorder to match FEATURE_NAMES exactly
+        df = pd.DataFrame([features])
+        return df[FEATURE_NAMES]
 
     def scale(self, df: pd.DataFrame) -> np.ndarray:
         """Apply standard scaling. Fits scaler if not yet fitted."""
