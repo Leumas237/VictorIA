@@ -25,6 +25,17 @@ def get_predictor(_app_version: str):
     from predictor import MatchPredictor
     return MatchPredictor(force_retrain=False)
 
+
+# 15 min cache keeps weather reasonably fresh while limiting API calls (free tier constraints).
+@st.cache_data(ttl=900, show_spinner=False)
+def get_weather_for_location(location_query: str):
+    return get_weather_fetcher().get_weather(location_query)
+
+
+@st.cache_resource(show_spinner=False)
+def get_weather_fetcher():
+    return WeatherFetcher()
+
 # ── Page config (must be first Streamlit call) ─────────────
 st.set_page_config(
     page_title="VictorIA – Prédiction Sportive IA",
@@ -237,7 +248,6 @@ with st.sidebar:
             value=False,
             help="Relance python train.py (1–2 min). À utiliser rarement.",
         )
-        show_model_breakdown = st.checkbox("📊 Détails des modèles", value=False)
         show_raw_features = st.checkbox("🔢 Afficher les features brutes", value=False)
 
     if st.button("🔄 Vider le cache", use_container_width=True):
@@ -383,10 +393,10 @@ if predict_btn:
     conf = report["confidence"]
     exact = report.get("exact_score", {})
     live_stats = report.get("live_stats", {})
-    weather_fetcher = WeatherFetcher()
-    weather = weather_fetcher.get_weather(report["home_stats"]["team"])
+    weather_query = f"{report['home_stats']['team']} stadium"
+    weather = get_weather_for_location(weather_query)
     weather_adjustment = weather.get("confidence_adjustment", 0.0) if weather.get("available") else 0.0
-    adjusted_conf = float(np.clip(conf + weather_adjustment, 0, 100))
+    adjusted_conf = np.clip(conf + weather_adjustment, 0, 100)
     conf_level, conf_color, conf_hint = confidence_visual(adjusted_conf)
 
     outcome_colors = {
@@ -419,7 +429,7 @@ if predict_btn:
             <span style='font-size:0.85rem;color:#9ca3af'>(xG {exact.get('xg_home', 1.5)} - {exact.get('xg_away', 1.2)})</span>
         </div>
         <div style='margin-top:1rem;display:flex;gap:0.5rem;justify-content:center;align-items:center;flex-wrap:wrap'>
-            <span style='background:{conf_color}22;color:{conf_color};padding:0.3rem 0.9rem;border-radius:99px;font-size:0.9rem;font-weight:700;border:1px solid {conf_color}44'>{conf_level}</span>
+            <span title='Niveau de confiance' style='background:{conf_color}22;color:{conf_color};padding:0.3rem 0.9rem;border-radius:99px;font-size:0.9rem;font-weight:700;border:1px solid {conf_color}44'>{conf_level}</span>
             <span style='color:#d5d9e3;font-size:0.9rem'>{adjusted_conf:.1f}% confiance ajustée météo ({adjustment_sign}{weather_adjustment:.1f}%)</span>
         </div>
         <div style='height:8px;background:#1f2937;border-radius:99px;margin-top:0.8rem;max-width:420px;margin-left:auto;margin-right:auto;'>
@@ -483,8 +493,11 @@ if predict_btn:
         ]
         rows_html = ""
         for label, h_val, a_val, suffix in comp_rows:
-            h_badge = "✅" if h_val >= a_val else "❌"
-            a_badge = "✅" if a_val > h_val else "❌"
+            if h_val == a_val:
+                h_badge, a_badge = "➖", "➖"
+            else:
+                h_badge = "✅" if h_val > a_val else "❌"
+                a_badge = "✅" if a_val > h_val else "❌"
             rows_html += (
                 f"<tr>"
                 f"<td style='padding:0.4rem;color:#dbe1ee'>{h_val:.1f}{suffix} {h_badge}</td>"
@@ -619,34 +632,33 @@ if predict_btn:
                 </div>
                 """, unsafe_allow_html=True)
 
-        if show_model_breakdown:
-            with st.expander("🤖 Détail par modèle", expanded=False):
-                bd = report["model_breakdown"]
-                cv = report.get("cv_scores", {})
-                cols = st.columns(max(len(bd), 1))
-                model_colors = {"XGBoost": "#f59e0b", "RandomForest": "#10b981", "NeuralNet": "#8b5cf6"}
-                for col, (model_name, model_probs) in zip(cols, bd.items()):
-                    color = model_colors.get(model_name, "#6b7280")
-                    cv_str = f"{cv.get(model_name, 0):.1%}" if cv.get(model_name) else "—"
-                    rows_html = ""
-                    for k, v in model_probs.items():
-                        rows_html += f"""
-                        <div style="display:flex;justify-content:space-between;margin-bottom:0.35rem">
-                            <span style="color:#9ca3af;font-size:0.8rem">{k}</span>
-                            <span style="color:#f0f1f5;font-weight:600;font-size:0.9rem">{v:.1f}%</span>
-                        </div>
-                        <div style="height:4px;background:#1f2937;border-radius:2px;margin-bottom:0.6rem">
-                            <div style="height:4px;width:{v}%;background:{color};border-radius:2px"></div>
-                        </div>
-                        """
-                    with col:
-                        st.markdown(f"""
-                        <div class="card" style="border-top:2px solid {color}">
-                            <div class="card-title">{model_name}</div>
-                            <div style="font-size:0.75rem;color:#9ca3af;margin-bottom:0.6rem">CV Acc: {cv_str}</div>
-                            {rows_html}
-                        </div>
-                        """, unsafe_allow_html=True)
+        with st.expander("🤖 Détail par modèle", expanded=False):
+            bd = report["model_breakdown"]
+            cv = report.get("cv_scores", {})
+            cols = st.columns(max(len(bd), 1))
+            model_colors = {"XGBoost": "#f59e0b", "RandomForest": "#10b981", "NeuralNet": "#8b5cf6"}
+            for col, (model_name, model_probs) in zip(cols, bd.items()):
+                color = model_colors.get(model_name, "#6b7280")
+                cv_str = f"{cv.get(model_name, 0):.1%}" if cv.get(model_name) else "—"
+                rows_html = ""
+                for k, v in model_probs.items():
+                    rows_html += f"""
+                    <div style="display:flex;justify-content:space-between;margin-bottom:0.35rem">
+                        <span style="color:#9ca3af;font-size:0.8rem">{k}</span>
+                        <span style="color:#f0f1f5;font-weight:600;font-size:0.9rem">{v:.1f}%</span>
+                    </div>
+                    <div style="height:4px;background:#1f2937;border-radius:2px;margin-bottom:0.6rem">
+                        <div style="height:4px;width:{v}%;background:{color};border-radius:2px"></div>
+                    </div>
+                    """
+                with col:
+                    st.markdown(f"""
+                    <div class="card" style="border-top:2px solid {color}">
+                        <div class="card-title">{model_name}</div>
+                        <div style="font-size:0.75rem;color:#9ca3af;margin-bottom:0.6rem">CV Acc: {cv_str}</div>
+                        {rows_html}
+                    </div>
+                    """, unsafe_allow_html=True)
 
         if show_raw_features and "feature_df" in report:
             with st.expander("🔢 Features brutes", expanded=False):
@@ -657,7 +669,7 @@ if predict_btn:
 
     with tab_h2h:
         h2h = report["h2h"]
-        with st.expander("⚔️ Historique des confrontations", expanded=True):
+        with st.expander("⚔️ Historique des confrontations", expanded=False):
             st.markdown(f"""
             <div class="card">
                 <div class="card-title">Statistiques H2H ({h2h['total']} matchs)</div>

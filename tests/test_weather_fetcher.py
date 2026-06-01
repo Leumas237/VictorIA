@@ -26,4 +26,4 @@ def test_get_weather_without_api_key():
     fetcher = WeatherFetcher(api_key="")
     weather = fetcher.get_weather("Paris")
     assert weather["available"] is False
-    assert "OPENWEATHER_API_KEY" in weather["reason"]
+    assert weather["reason"] == "OPENWEATHER_API_KEY manquante"

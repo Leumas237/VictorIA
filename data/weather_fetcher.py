@@ -14,9 +14,12 @@ class WeatherFetcher:
 
     GEO_URL = "https://api.openweathermap.org/geo/1.0/direct"
     WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
+    DEFAULT_TIMEOUT = 5  # keep UI responsive if provider is slow.
+    BASE_WEATHER_SCORE = 70  # neutral weather baseline for confidence scoring (0-100).
+    ADJUSTMENT_MULTIPLIER = 6  # scales confidence adjustment points into score points.
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("OPENWEATHER_API_KEY", "")
+        self._api_key = os.getenv("OPENWEATHER_API_KEY", "") if api_key is None else api_key
 
     @staticmethod
     def _emoji(main: str) -> str:
@@ -70,8 +73,19 @@ class WeatherFetcher:
             confidence_adjustment += 1.5
             notes.append("Conditions stables: lecture du match plus fiable.")
 
+        # Clamp weather adjustment to avoid over-penalizing or over-boosting model confidence.
         confidence_adjustment = max(-8.0, min(4.0, confidence_adjustment))
-        weather_score = round(max(0.0, min(100.0, 70 + confidence_adjustment * 6)), 1)
+        weather_score = round(
+            max(
+                0.0,
+                min(
+                    100.0,
+                    WeatherFetcher.BASE_WEATHER_SCORE
+                    + confidence_adjustment * WeatherFetcher.ADJUSTMENT_MULTIPLIER,
+                ),
+            ),
+            1,
+        )
 
         return {
             "confidence_adjustment": round(confidence_adjustment, 1),
@@ -83,7 +97,7 @@ class WeatherFetcher:
 
     def get_weather(self, location_query: str) -> dict[str, Any]:
         """Returns weather payload + impact scoring. Gracefully degrades if unavailable."""
-        if not self.api_key:
+        if not self._api_key:
             return {
                 "available": False,
                 "location": location_query,
@@ -93,8 +107,8 @@ class WeatherFetcher:
         try:
             geo_resp = requests.get(
                 self.GEO_URL,
-                params={"q": location_query, "limit": 1, "appid": self.api_key},
-                timeout=8,
+                params={"q": location_query, "limit": 1, "appid": self._api_key},
+                timeout=self.DEFAULT_TIMEOUT,
             )
             geo_resp.raise_for_status()
             geo_data = geo_resp.json() or []
@@ -111,11 +125,11 @@ class WeatherFetcher:
                 params={
                     "lat": place["lat"],
                     "lon": place["lon"],
-                    "appid": self.api_key,
+                    "appid": self._api_key,
                     "units": "metric",
                     "lang": "fr",
                 },
-                timeout=8,
+                timeout=self.DEFAULT_TIMEOUT,
             )
             weather_resp.raise_for_status()
             payload = weather_resp.json()
@@ -147,7 +161,7 @@ class WeatherFetcher:
 
         return {
             "available": True,
-            "location": f"{place.get('name', '')}, {place.get('country', '')}".strip(", "),
+            "location": ", ".join(filter(None, [place.get("name"), place.get("country")])),
             "emoji": self._emoji(weather_main),
             "conditions": weather_desc.capitalize(),
             "temperature_c": round(temp_c, 1),
